@@ -31,13 +31,13 @@ const _ = cockpit.gettext;
 const DRIVER = "mysql";
 
 function run(cmd: string, args: string[] = []) {
-    const helper = "/usr/local/libexec/cockpit-adminer-helper";
-    const printable = [helper, cmd, ...args, "/var/run/mysqld/mysqld.sock"].map(
+    const helper = "/usr/local/libexec/cockpit-apache-helper";
+    const printable = [helper, cmd, ...args].map(
         (value) => `"${String(value).replace(/"/g, '\\"')}"`
     );
-    console.log("spawning:", printable.join(" "));
+    console.debug("spawning:", printable.join(" "));
     return cockpit
-        .spawn([helper, cmd, ...args, "/var/run/mysqld/mysqld.sock"], {
+        .spawn([helper, cmd, ...args], {
             superuser: "try",
             err: "message",
         })
