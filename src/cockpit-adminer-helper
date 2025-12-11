@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+
+echo "SHELL=$SHELL" >&2
+echo "BASH_VERSION=${BASH_VERSION-<unset>}" >&2
+
+set -euo pipefail
+
+# Ensure typical admin paths; Cockpit sessions often miss /usr/sbin
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
+SITES_AVAIL="/etc/apache2/sites-available"
+SITES_EN="/etc/apache2/sites-enabled"
+
+A2ENSITE="/usr/sbin/a2ensite"
+A2DISSITE="/usr/sbin/a2dissite"
+APACHECTL="/usr/sbin/apache2ctl"
+SYSTEMCTL="/bin/systemctl"
+
+MYSQL_CLIENT="$(command -v mysql || true)"
+PSQL_CLIENT="$(command -v psql || true)"
+
+mysql_json_query() {
+  local host="$1"
+  local port="$2"
+  local user="$3"
+  local pass="$4"
+  local database="$5"
+  local sql="$6"
+  local socket="${7-}"
+
+  if [ -z "$MYSQL_CLIENT" ]; then
+    echo "mysql client is not installed" >&2
+    exit 127
+  fi
+
+  # Build args more flexibly: host/port/socket are optional
+  local -a args=("$MYSQL_CLIENT" --batch --raw --default-character-set=utf8mb4 --user "$user")
+
+  if [ -n "$host" ]; then
+    args+=(--host "$host")
+  fi
+
+  if [ -n "$port" ]; then
+    args+=(--port "$port")
+  fi
+
+  if [ -n "$socket" ]; then
+    args+=(--socket "$socket")
+  fi
+
+  if [ -n "$database" ]; then
+    args+=(--database "$database")
+  fi
+
+  MYSQL_PWD="$pass" "${args[@]}" --execute "$sql" | python3 - "$sql" <<'PY'
+import json
+import sys
+
+lines = [line.rstrip("\r\n") for line in sys.stdin if line.strip() != ""]
+
+if not lines:
+    print(json.dumps({"columns": [], "rows": [], "rowCount": 0, "message": "ok"}))
+    raise SystemExit
+
+is_table = len(lines) > 1 or any("\t" in line for line in lines)
+
+if not is_table:
+    print(json.dumps({"columns": [], "rows": [], "rowCount": 0, "message": "\n".join(lines)}))
+    raise SystemExit
+
+columns = lines[0].split("\t")
+rows = [line.split("\t") for line in lines[1:]]
+
+print(json.dumps({"columns": columns, "rows": rows, "rowCount": len(rows)}))
+PY
+}
+
+psql_json_query() {
+  local host="$1"
+  local port="$2"
+  local user="$3"
+  local pass="$4"
+  local database="$5"
+  local sql="$6"
+  local socket="${7-}"
+
+  if [ -z "$PSQL_CLIENT" ]; then
+    echo "psql client is not installed" >&2
+    exit 127
+  fi
+
+  local target_db="$database"
+  if [ -z "$target_db" ]; then
+    target_db="postgres"
+  fi
+
+  # If socket is provided, use it as host (directory where the socket lives)
+  local -a args=("$PSQL_CLIENT")
+
+  if [ -n "$socket" ]; then
+    args+=(-h "$socket")
+  elif [ -n "$host" ]; then
+    args+=(-h "$host")
+  fi
+
+  if [ -n "$port" ]; then
+    args+=(-p "$port")
+  fi
+
+  args+=(-U "$user" -d "$target_db" -F $'\t' -A -q -t)
+
+  PGPASSWORD="$pass" "${args[@]}" -c "$sql" | python3 - "$sql" <<'PY'
+import json
+import sys
+
+lines = [line.rstrip("\r\n") for line in sys.stdin if line.strip() != ""]
+
+if not lines:
+    print(json.dumps({"columns": [], "rows": [], "rowCount": 0, "message": "ok"}))
+    raise SystemExit
+
+is_table = len(lines) > 1 or any("\t" in line for line in lines)
+
+if not is_table:
+    print(json.dumps({"columns": [], "rows": [], "rowCount": 0, "message": "\n".join(lines)}))
+    raise SystemExit
+
+columns = lines[0].split("\t")
+rows = [line.split("\t") for line in lines[1:]]
+
+print(json.dumps({"columns": columns, "rows": rows, "rowCount": len(rows)}))
+PY
+}
+
+case "${1:-}" in
+  list)
+    echo "["
+    first=1
+    shopt -s nullglob
+    for f in "$SITES_AVAIL"/*.conf; do
+      name="$(basename "$f")"
+      enabled=false
+      [ -L "$SITES_EN/$name" ] && enabled=true
+      entry=$(printf '{"name":"%s","path":"%s","enabled":%s}' "$name" "$f" "$enabled")
+      if [ $first -eq 1 ]; then first=0; else printf ",\n"; fi
+      printf "%s" "$entry"
+    done
+    echo "]"
+    ;;
+
+  read)
+    name="${2:-}"; [[ "$name" =~ ^[A-Za-z0-9._-]+\.conf$ ]] || { echo "Invalid name"; exit 2; }
+    cat "$SITES_AVAIL/$name"
+    ;;
+
+  write)
+    name="${2:-}"; content="${3:-}"; [[ "$name" =~ ^[A-Za-z0-9._-]+\.conf$ ]] || { echo "Invalid name"; exit 2; }
+    tmp="$(mktemp)"
+    printf "%s" "$content" > "$tmp"
+    install -m 0644 "$tmp" "$SITES_AVAIL/$name"
+    rm -f "$tmp"
+    echo "OK"
+    ;;
+
+  enable)
+    name="${2:-}"; "$A2ENSITE" "$name" >/dev/null; echo "enabled $name"
+    ;;
+
+  disable)
+    name="${2:-}"; "$A2DISSITE" "${2:-}" >/dev/null; echo "disabled ${2:-}"
+    ;;
+
+  test)
+    "$APACHECTL" -t
+    ;;
+
+  reload)
+    "$SYSTEMCTL" reload apache2
+    echo "reloaded"
+    ;;
+
+  db-query)
+    driver="${2:-mysql}"
+    host="${3:-localhost}"
+    port="${4:-3306}"
+    user="${5:-root}"
+    pass="${6:-}"
+    if [ "$pass" = "__ENV__" ]; then
+      pass="${ADMINER_DB_PASSWORD-}"
+    fi
+    database="${7:-}"
+    query_b64="${8:-}"
+    socket="${9:-}"
+
+    if [ -z "$query_b64" ]; then
+      echo "SQL payload missing" >&2
+      exit 2
+    fi
+
+    sql="$(printf '%s' "$query_b64" | base64 --decode)"
+
+    case "$driver" in
+      mysql)
+        mysql_json_query "$host" "$port" "$user" "$pass" "$database" "$sql" "$socket"
+        ;;
+      postgres|postgresql|psql)
+        psql_json_query "$host" "$port" "$user" "$pass" "$database" "$sql" "$socket"
+        ;;
+      *)
+        echo "Unsupported driver: $driver" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+
+  *)
+    echo "Usage: $0 {list|read <name>|write <name> <content>|enable <name>|disable <name>|test|reload|db-query <mysql|postgres> <host> <port> <user> <password> [database] <base64-sql> [--socket PATH]}" >&2
+    exit 1
+    ;;
+esac
